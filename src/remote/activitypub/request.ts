@@ -1,51 +1,17 @@
 import * as https from 'https';
 import { sign } from 'http-signature';
 import * as crypto from 'crypto';
-import * as cache from 'lookup-dns-cache';
 
 import config from '../../config';
 import { ILocalUser } from '../../models/entities/user';
-import { publishApLogStream } from '../../services/stream';
-import { apLogger } from './logger';
-import { UserKeypairs, Instances } from '../../models';
-import { fetchMeta } from '../../misc/fetch-meta';
-import { toPuny } from '../../misc/convert-host';
+import { UserKeypairs } from '../../models';
 import { ensure } from '../../prelude/ensure';
-import * as httpsProxyAgent from 'https-proxy-agent';
-
-export const logger = apLogger.createSubLogger('deliver');
-
-const agent = config.proxy
-	? new httpsProxyAgent(config.proxy)
-	: new https.Agent({
-			lookup: cache.lookup,
-		});
+import { getAgentByUrl } from '../../misc/fetch';
 
 export default async (user: ILocalUser, url: string, object: any) => {
 	const timeout = 10 * 1000;
 
-	const { protocol, host, hostname, port, pathname, search } = new URL(url);
-
-	// ブロックしてたら中断
-	const meta = await fetchMeta();
-	if (meta.blockedHosts.includes(toPuny(host))) {
-		logger.info(`skip (blocked) ${url}`);
-		return;
-	}
-
-	// closedなら中断
-	const closedHosts = await Instances.find({
-		where: {
-			isMarkedAsClosed: true
-		},
-		cache: 60 * 1000
-	});
-	if (closedHosts.map(x => x.host).includes(toPuny(host))) {
-		logger.info(`skip (closed) ${url}`);
-		return;
-	}
-
-	logger.info(`--> ${url}`);
+	const { protocol, hostname, port, pathname, search } = new URL(url);
 
 	const data = JSON.stringify(object);
 
@@ -59,7 +25,7 @@ export default async (user: ILocalUser, url: string, object: any) => {
 
 	await new Promise((resolve, reject) => {
 		const req = https.request({
-			agent,
+			agent: getAgentByUrl(new URL(`https://example.net`)),
 			protocol,
 			hostname,
 			port,
@@ -73,10 +39,8 @@ export default async (user: ILocalUser, url: string, object: any) => {
 			}
 		}, res => {
 			if (res.statusCode! >= 400) {
-				logger.warn(`${url} --> ${res.statusCode}`);
 				reject(res);
 			} else {
-				logger.succ(`${url} --> ${res.statusCode}`);
 				resolve();
 			}
 		});
@@ -84,14 +48,9 @@ export default async (user: ILocalUser, url: string, object: any) => {
 		sign(req, {
 			authorizationHeaderName: 'Signature',
 			key: keypair.privateKey,
-			keyId: `${config.url}/users/${user.id}/publickey`,
+			keyId: `${config.url}/users/${user.id}#main-key`,
 			headers: ['date', 'host', 'digest']
 		});
-
-		// Signature: Signature ... => Signature: ...
-		let sig = req.getHeader('Signature')!.toString();
-		sig = sig.replace(/^Signature /, '');
-		req.setHeader('Signature', sig);
 
 		req.on('timeout', () => req.abort());
 
@@ -102,13 +61,4 @@ export default async (user: ILocalUser, url: string, object: any) => {
 
 		req.end(data);
 	});
-
-	//#region Log
-	publishApLogStream({
-		direction: 'out',
-		activity: object.type,
-		host: null,
-		actor: user.username
-	});
-	//#endregion
 };
